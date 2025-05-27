@@ -1,0 +1,236 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY_BACKEND: kpi-dashboard-backend
+  ECR_REPOSITORY_FRONTEND: kpi-dashboard-frontend
+  BACKEND_APP_RUNNER_SERVICE: kpi-dashboard-backend
+  FRONTEND_APP_RUNNER_SERVICE: kpi-dashboard-frontend
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app: [backend, frontend]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: ${{ matrix.app }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ${{ matrix.app }}
+
+      - name: Lint
+        run: npm run lint
+        working-directory: ${{ matrix.app }}
+
+      - name: Test
+        run: npm run test
+        working-directory: ${{ matrix.app }}
+
+      - name: Upload test coverage
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.app }}-coverage
+          path: ${{ matrix.app }}/coverage
+          retention-days: 5
+
+  build:
+    name: Build and Push Docker Images
+    needs: test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        app: [backend, frontend]
+        include:
+          - app: backend
+            ecr_repository: ${{ env.ECR_REPOSITORY_BACKEND }}
+          - app: frontend
+            ecr_repository: ${{ env.ECR_REPOSITORY_FRONTEND }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./${{ matrix.app }}
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ matrix.ecr_repository }}:latest
+            ${{ steps.login-ecr.outputs.registry }}/${{ matrix.ecr_repository }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-dev:
+    name: Deploy to Dev
+    needs: build
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev')
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Update App Runner Services
+        run: |
+          # Update backend service
+          aws apprunner update-service \
+            --service-name ${{ env.BACKEND_APP_RUNNER_SERVICE }}-dev \
+            --source-configuration "ImageRepository={ImageIdentifier=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_BACKEND }}:${{ github.sha }},ImageConfiguration={Port=3000,EnvironmentVariables={NODE_ENV=development,API_BASE_URL=${{ secrets.API_BASE_URL }}}},ImageRepositoryType=ECR}" \
+            --region ${{ env.AWS_REGION }}
+          
+          # Wait for backend service update to complete
+          aws apprunner wait service-updated \
+            --service-name ${{ env.BACKEND_APP_RUNNER_SERVICE }}-dev \
+            --region ${{ env.AWS_REGION }}
+          
+          # Update frontend service
+          aws apprunner update-service \
+            --service-name ${{ env.FRONTEND_APP_RUNNER_SERVICE }}-dev \
+            --source-configuration "ImageRepository={ImageIdentifier=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_FRONTEND }}:${{ github.sha }},ImageConfiguration={Port=80,EnvironmentVariables={NODE_ENV=development,REACT_APP_API_URL=${{ secrets.REACT_APP_API_URL }}}},ImageRepositoryType=ECR}" \
+            --region ${{ env.AWS_REGION }}
+          
+          # Wait for frontend service update to complete
+          aws apprunner wait service-updated \
+            --service-name ${{ env.FRONTEND_APP_RUNNER_SERVICE }}-dev \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Get service URLs
+        id: get-urls
+        run: |
+          BACKEND_URL=$(aws apprunner describe-service --service-name ${{ env.BACKEND_APP_RUNNER_SERVICE }}-dev --region ${{ env.AWS_REGION }} --query "Service.ServiceUrl" --output text)
+          FRONTEND_URL=$(aws apprunner describe-service --service-name ${{ env.FRONTEND_APP_RUNNER_SERVICE }}-dev --region ${{ env.AWS_REGION }} --query "Service.ServiceUrl" --output text)
+          echo "BACKEND_URL=https://${BACKEND_URL}" >> $GITHUB_ENV
+          echo "FRONTEND_URL=https://${FRONTEND_URL}" >> $GITHUB_ENV
+
+      - name: Verify deployment
+        run: |
+          chmod +x ./scripts/verify-deployment.sh
+          ./scripts/verify-deployment.sh -b ${{ env.BACKEND_URL }} -f ${{ env.FRONTEND_URL }}
+
+  deploy-prod:
+    name: Deploy to Production
+    needs: build
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prod')
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Update App Runner Services
+        run: |
+          # Update backend service
+          aws apprunner update-service \
+            --service-name ${{ env.BACKEND_APP_RUNNER_SERVICE }} \
+            --source-configuration "ImageRepository={ImageIdentifier=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_BACKEND }}:${{ github.sha }},ImageConfiguration={Port=3000,EnvironmentVariables={NODE_ENV=production,API_BASE_URL=${{ secrets.API_BASE_URL }}}},ImageRepositoryType=ECR}" \
+            --region ${{ env.AWS_REGION }}
+          
+          # Wait for backend service update to complete
+          aws apprunner wait service-updated \
+            --service-name ${{ env.BACKEND_APP_RUNNER_SERVICE }} \
+            --region ${{ env.AWS_REGION }}
+          
+          # Update frontend service
+          aws apprunner update-service \
+            --service-name ${{ env.FRONTEND_APP_RUNNER_SERVICE }} \
+            --source-configuration "ImageRepository={ImageIdentifier=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_FRONTEND }}:${{ github.sha }},ImageConfiguration={Port=80,EnvironmentVariables={NODE_ENV=production,REACT_APP_API_URL=${{ secrets.REACT_APP_API_URL }}}},ImageRepositoryType=ECR}" \
+            --region ${{ env.AWS_REGION }}
+          
+          # Wait for frontend service update to complete
+          aws apprunner wait service-updated \
+            --service-name ${{ env.FRONTEND_APP_RUNNER_SERVICE }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Get service URLs
+        id: get-urls
+        run: |
+          BACKEND_URL=$(aws apprunner describe-service --service-name ${{ env.BACKEND_APP_RUNNER_SERVICE }} --region ${{ env.AWS_REGION }} --query "Service.ServiceUrl" --output text)
+          FRONTEND_URL=$(aws apprunner describe-service --service-name ${{ env.FRONTEND_APP_RUNNER_SERVICE }} --region ${{ env.AWS_REGION }} --query "Service.ServiceUrl" --output text)
+          echo "BACKEND_URL=https://${BACKEND_URL}" >> $GITHUB_ENV
+          echo "FRONTEND_URL=https://${FRONTEND_URL}" >> $GITHUB_ENV
+
+      - name: Verify deployment
+        run: |
+          chmod +x ./scripts/verify-deployment.sh
+          ./scripts/verify-deployment.sh -b ${{ env.BACKEND_URL }} -f ${{ env.FRONTEND_URL }}
+
+      - name: Create deployment tag
+        run: |
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          git tag "prod-${TIMESTAMP}-${GITHUB_SHA:0:7}"
+          git push origin "prod-${TIMESTAMP}-${GITHUB_SHA:0:7}"
